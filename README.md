@@ -13,7 +13,13 @@ Posting is a browser handoff by default (`https://x.com/intent/tweet`). Paid X A
 ```bash
 omarchy plugin add https://github.com/maiosx/X-Composer.git --enable --yes
 ```
+Add a Hyprland binding to `~/.config/hypr/bindings.lua`:
 
+```lua
+o.bind("SUPER + A", "Overview", "omarchy-shell shell toggle x.composer")
+```
+
+Choose any unused chord if `SUPER + A` is already bound.
 For a local checkout:
 
 ```bash
