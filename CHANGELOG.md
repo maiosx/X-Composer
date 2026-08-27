@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.2
+
+- Hide the overlay as soon as **Continue in X** is pressed.
+
 ## 1.0.1
 
 - Enter inserts a newline. Submit only from **Continue in X**.

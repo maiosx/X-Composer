@@ -70,6 +70,7 @@ Item {
   function submit() {
     if (!root.canSubmit) return
     if (serviceReady) xtweet.submit()
+    root.dismiss()
   }
 
   function compose(text) {

@@ -5,7 +5,7 @@
 
 [project]
 name = "x-composer"
-version = "1.0.1"
+version = "1.0.2"
 description = "X Composer Omarchy overlay: fullscreen serif composer, browser-intent handoff by default, explicit opt-in paid API posting."
 authors = [
   { name = "maiosx" }

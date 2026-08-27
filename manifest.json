@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "x.composer",
   "name": "X Composer",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "author": "maiosx",
   "license": "MIT",
   "description": "Fullscreen X composer overlay. Serif on black, no outline. Browser handoff by default, optional paid API.",
