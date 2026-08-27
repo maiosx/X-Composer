@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.3
+
+- Local state is opened `O_NOFOLLOW|O_NONBLOCK`, then checked as an owned regular file and read with a byte cap. Stdin JSON and X API bodies are similarly bounded.
+
 ## 1.0.2
 
 - Hide the overlay as soon as **Continue in X** is pressed.

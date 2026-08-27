@@ -32,6 +32,11 @@ Modes
 Security posture
     * ~/.config/xtweet is kept 0700 and config.toml 0600; symlinks, foreign
       owners, or group/other permission bits are refused.
+    * Local state (config, draft, active, job files) is opened descriptor-first
+      with O_NOFOLLOW|O_NONBLOCK, then checked as an owned regular file and
+      read with a strict byte cap — a planted FIFO or oversized file cannot
+      block the backend or inflate the QML client.
+    * Stdin JSON and X API success/error bodies are read with the same caps.
     * Job state lives under $XDG_RUNTIME_DIR/x.composer (0700) with 0600
       files; OAuth secrets are never copied into job files.
     * The Web Intent URL embeds the draft text and is never logged, echoed,
@@ -43,10 +48,12 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import errno
 import fcntl
 import hashlib
 import html
 import hmac
+import io
 import json
 import os
 import re
@@ -75,6 +82,15 @@ GC_AGE = 7 * 86400  # finished job dirs are garbage-collected after a week
 
 TERMINAL_STATES = frozenset({"posted", "handoff", "rejected", "unknown"})
 _JOB_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[a-f0-9]{8}$")
+
+# Caps for anything that can carry tweet text (stdin, draft, job JSON, API echo).
+MAX_PAYLOAD_BYTES = 128 * 1024
+MAX_CONFIG_BYTES = 64 * 1024
+MAX_STATE_BYTES = MAX_PAYLOAD_BYTES
+MAX_STDIN_BYTES = MAX_PAYLOAD_BYTES
+MAX_HTTP_BODY_BYTES = MAX_PAYLOAD_BYTES
+MAX_ACTIVE_BYTES = 64
+_READ_CHUNK = 8192
 
 BACKEND_PATH = Path(__file__).resolve()
 PLUGIN_DIR = BACKEND_PATH.parent
@@ -172,20 +188,124 @@ def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
         raise
 
 
+def _open_flags(flags: int) -> int:
+    return flags | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+
+
+def _set_blocking(fd: int) -> None:
+    """Drop O_NONBLOCK so a child inheriting this fd can write normally."""
+    cur = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, cur & ~os.O_NONBLOCK)
+
+
+def _check_owned_regular(fd: int, what: str | None = None, *, kind: str = "config") -> os.stat_result:
+    """fstat(fd) must be a regular file owned by us. Raises or OSError."""
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        if what:
+            raise BackendError(kind, f"{what} is not a regular file — refusing")
+        raise OSError(errno.EINVAL, "not a regular file")
+    if st.st_uid != os.geteuid():
+        if what:
+            raise BackendError(kind, f"{what} is not owned by you (uid {st.st_uid}) — refusing")
+        raise OSError(errno.EPERM, "wrong owner")
+    return st
+
+
+def _read_fd_capped(fd: int, cap: int) -> bytes:
+    """Read at most cap+1 bytes from fd. Caller treats len > cap as oversized."""
+    chunks: list[bytes] = []
+    n = 0
+    while n <= cap:
+        try:
+            buf = os.read(fd, min(_READ_CHUNK, cap + 1 - n))
+        except BlockingIOError:
+            break
+        if not buf:
+            break
+        n += len(buf)
+        chunks.append(buf)
+        if n > cap:
+            break
+    return b"".join(chunks)
+
+
+def _read_bounded(read_fn, cap: int) -> bytes:
+    """Read at most cap+1 bytes from a .read(n) callable."""
+    chunks: list[bytes] = []
+    n = 0
+    while n <= cap:
+        buf = read_fn(min(_READ_CHUNK, cap + 1 - n))
+        if not buf:
+            break
+        n += len(buf)
+        chunks.append(buf)
+        if n > cap:
+            break
+    return b"".join(chunks)
+
+
+def read_local_bytes(path: Path, cap: int, *, what: str | None = None, kind: str = "config") -> bytes | None:
+    """Descriptor-first O_NOFOLLOW|O_NONBLOCK read of an owned regular file.
+
+    Returns None if the path is absent or (when `what` is None) unusable.
+    Raises BackendError when `what` is set and the file is present but unsafe
+    or oversized.
+    """
+    try:
+        fd = os.open(path, _open_flags(os.O_RDONLY))
+    except FileNotFoundError:
+        if what:
+            raise BackendError(kind, f"{what} is missing — refusing")
+        return None
+    except OSError as e:
+        if what:
+            raise BackendError(kind, f"cannot read {what}: {e.strerror}") from e
+        return None
+    try:
+        try:
+            st = _check_owned_regular(fd, what, kind=kind)
+        except OSError:
+            return None
+        if st.st_size > cap:
+            if what:
+                raise BackendError(kind, f"{what} exceeds {cap} bytes — refusing")
+            return None
+        raw = _read_fd_capped(fd, cap)
+        if len(raw) > cap:
+            if what:
+                raise BackendError(kind, f"{what} exceeds {cap} bytes — refusing")
+            return None
+        return raw
+    finally:
+        os.close(fd)
+
+
 def read_json(path: Path) -> object | None:
     """Read a JSON file without following symlinks; None if absent/broken."""
-    try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except OSError:
-        return None
-    with os.fdopen(fd, "rb") as f:
-        raw = f.read()
+    raw = read_local_bytes(path, MAX_STATE_BYTES)
     if not raw:
         return None
     try:
         return json.loads(raw)
     except ValueError:
         return None
+
+
+def _open_owned_lock(path: Path, *, what: str, kind: str) -> int:
+    """Create/open a lock file: O_NOFOLLOW|O_NONBLOCK, owned regular file."""
+    try:
+        fd = os.open(path, _open_flags(os.O_RDWR | os.O_CREAT), 0o600)
+    except OSError as e:
+        raise BackendError(kind, f"cannot open {what}: {e.strerror}") from e
+    try:
+        _check_owned_regular(fd, what, kind=kind)
+        os.fchmod(fd, 0o600)
+        return fd
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        raise
 
 
 def _pid_alive(pid: object) -> bool:
@@ -235,15 +355,17 @@ def ensure_config_files() -> None:
 
 def load_config() -> dict:
     ensure_config_files()
+    raw = read_local_bytes(
+        CONFIG_FILE,
+        MAX_CONFIG_BYTES,
+        what="~/.config/xtweet/config.toml",
+    )
+    if not raw:
+        raise BackendError("config", f"cannot read {CONFIG_FILE}")
     try:
-        fd = os.open(CONFIG_FILE, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except OSError as e:
-        raise BackendError("config", f"cannot read {CONFIG_FILE}: {e.strerror}") from e
-    with os.fdopen(fd, "rb") as f:
-        try:
-            cfg = tomllib.load(f)
-        except tomllib.TOMLDecodeError as e:
-            raise BackendError("config", f"~/.config/xtweet/config.toml is not valid TOML: {e}") from e
+        cfg = tomllib.load(io.BytesIO(raw))
+    except tomllib.TOMLDecodeError as e:
+        raise BackendError("config", f"~/.config/xtweet/config.toml is not valid TOML: {e}") from e
     return cfg if isinstance(cfg, dict) else {}
 
 
@@ -312,10 +434,12 @@ def _job_dir(rt: Path, jid: str) -> Path:
 
 
 def _read_active(rt: Path) -> str | None:
+    raw = read_local_bytes(rt / "active", MAX_ACTIVE_BYTES)
+    if not raw:
+        return None
     try:
-        with open(rt / "active", "r", encoding="ascii") as f:
-            jid = f.read().strip()
-    except OSError:
+        jid = raw.decode("ascii").strip()
+    except UnicodeDecodeError:
         return None
     return jid if _JOB_ID_RE.match(jid) else None
 
@@ -399,13 +523,8 @@ def _gc_old_jobs(rt: Path) -> None:
 @contextlib.contextmanager
 def _global_lock(rt: Path):
     """Serialize job reservation with a kernel-owned, crash-safe file lock."""
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    fd = _open_owned_lock(rt / "lock", what="$XDG_RUNTIME_DIR/x.composer/lock", kind="internal")
     try:
-        fd = os.open(rt / "lock", flags, 0o600)
-    except OSError as e:
-        raise BackendError("internal", f"cannot open the job lock: {e.strerror}") from e
-    try:
-        os.fchmod(fd, 0o600)
         deadline = time.monotonic() + 5.0
         while True:
             try:
@@ -477,14 +596,28 @@ def oauth1_header(
 
 def _api_error_detail(e: urllib.error.HTTPError) -> str:
     try:
-        payload = json.loads(e.read() or b"{}")
-    except (OSError, ValueError):
+        raw = _read_http_body(e)
+    except OSError:
+        raw = b""
+    if raw is None:
+        return f"HTTP {e.code}"
+    try:
+        payload = json.loads(raw or b"{}")
+    except ValueError:
         payload = {}
     if isinstance(payload, dict):
         bits = [str(payload.get(k)) for k in ("title", "detail") if payload.get(k)]
         if bits:
             return ": ".join(bits)[:200]
     return f"HTTP {e.code}"
+
+
+def _read_http_body(fp, cap: int = MAX_HTTP_BODY_BYTES) -> bytes | None:
+    """Bounded HTTP body. None means oversized and untrusted."""
+    raw = _read_bounded(fp.read, cap)
+    if len(raw) > cap:
+        return None
+    return raw
 
 
 def api_post_tweet(text: str, ck: str, cs: str, tok: str, tsec: str) -> dict:
@@ -503,7 +636,7 @@ def api_post_tweet(text: str, ck: str, cs: str, tok: str, tsec: str) -> dict:
     )
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            code, raw = resp.status, resp.read()
+            code, raw = resp.status, _read_http_body(resp)
     except urllib.error.HTTPError as e:
         # A 4xx response is an explicit rejection. A server-side response can
         # arrive after X committed the post, so 5xx failures are ambiguous.
@@ -515,6 +648,11 @@ def api_post_tweet(text: str, ck: str, cs: str, tok: str, tsec: str) -> dict:
         }
     except (urllib.error.URLError, TimeoutError, OSError):
         return {"state": "unknown", "message": "network error — could not confirm whether the post succeeded; check X before retrying"}
+    if raw is None:
+        return {
+            "state": "unknown",
+            "message": "X API response was too large to confirm whether the post succeeded — check X before retrying",
+        }
     try:
         payload = json.loads(raw or b"{}")
     except ValueError:
@@ -598,7 +736,9 @@ def cmd_mode() -> int:
 
 
 def read_stdin_json_object() -> dict:
-    raw = sys.stdin.buffer.read()
+    raw = _read_bounded(sys.stdin.buffer.read, MAX_STDIN_BYTES)
+    if len(raw) > MAX_STDIN_BYTES:
+        raise BackendError("input", f"stdin exceeds {MAX_STDIN_BYTES} bytes")
     if not raw.strip():
         raise BackendError("usage", "expected a JSON object on stdin")
     try:
@@ -672,8 +812,15 @@ def cmd_enqueue() -> int:
         _write_state(rt, jid, **state_fields)
         _write_active(rt, jid)
         try:
-            logfd = os.open(jd / "worker.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            logfd = os.open(
+                jd / "worker.log",
+                _open_flags(os.O_WRONLY | os.O_CREAT | os.O_APPEND),
+                0o600,
+            )
             try:
+                _check_owned_regular(logfd, "job worker.log", kind="internal")
+                os.fchmod(logfd, 0o600)
+                _set_blocking(logfd)
                 subprocess.Popen(
                     [sys.executable, str(BACKEND_PATH), "_worker", jid],
                     stdin=subprocess.DEVNULL,
@@ -685,6 +832,10 @@ def cmd_enqueue() -> int:
                 )
             finally:
                 os.close(logfd)
+        except BackendError:
+            _finish_job(rt, jid)
+            shutil.rmtree(jd, ignore_errors=True)
+            raise
         except OSError as e:
             _finish_job(rt, jid)
             shutil.rmtree(jd, ignore_errors=True)
@@ -757,13 +908,8 @@ def cmd_ack(argv: list[str]) -> int:
 
 @contextlib.contextmanager
 def _draft_lock():
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    fd = _open_owned_lock(CONFIG_DIR / "draft.lock", what="~/.config/xtweet/draft.lock", kind="config")
     try:
-        fd = os.open(CONFIG_DIR / "draft.lock", flags, 0o600)
-    except OSError as e:
-        raise BackendError("config", f"cannot open the draft lock: {e.strerror}") from e
-    try:
-        os.fchmod(fd, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
@@ -828,7 +974,7 @@ def cmd_draft(argv: list[str]) -> int:
 
 def _claim_worker(jd: Path) -> None:
     """Atomically ensure exactly one worker can execute a queued post."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    flags = _open_flags(os.O_WRONLY | os.O_CREAT | os.O_EXCL)
     try:
         fd = os.open(jd / "worker.json", flags, 0o600)
     except FileExistsError as e:
@@ -837,6 +983,7 @@ def _claim_worker(jd: Path) -> None:
         raise BackendError("internal", f"cannot claim the job worker: {e.strerror}") from e
     try:
         os.fchmod(fd, 0o600)
+        _check_owned_regular(fd, "job worker.json", kind="internal")
         payload = json.dumps({"pid": os.getpid(), "started": time.time()}).encode("utf-8")
         os.write(fd, payload)
         os.fsync(fd)

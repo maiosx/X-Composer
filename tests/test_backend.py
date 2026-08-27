@@ -19,6 +19,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -27,11 +28,12 @@ from pathlib import Path
 
 BACKEND = Path(__file__).resolve().parent.parent / "backend.py"
 TERMINAL = {"posted", "handoff", "rejected", "unknown"}
+PY = sys.executable
 
 
 def run(env, *args, payload=None, ok=True):
     p = subprocess.run(
-        [str(BACKEND), *args],
+        [PY, str(BACKEND), *args],
         input=None if payload is None else json.dumps(payload),
         text=True,
         capture_output=True,
@@ -127,7 +129,7 @@ with tempfile.TemporaryDirectory(prefix="xtweet-reg-") as td:
         time.sleep(0.02)
     assert worker_claim.exists(), "detached worker never claimed the job"
     replay = subprocess.run(
-        [str(BACKEND), "_worker", jid],
+        [PY, str(BACKEND), "_worker", jid],
         text=True,
         capture_output=True,
         env=env,
@@ -182,14 +184,14 @@ with tempfile.TemporaryDirectory(prefix="xtweet-reg-") as td:
         _, base = run(env, "draft", "set", payload={"text": "A"}, ok=True)
         rev = base["revision"]
         clear = subprocess.Popen(
-            [str(BACKEND), "draft", "clear", str(rev)],
+            [PY, str(BACKEND), "draft", "clear", str(rev)],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
         )
         setter = subprocess.Popen(
-            [str(BACKEND), "draft", "set"],
+            [PY, str(BACKEND), "draft", "set"],
             text=True,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -203,6 +205,83 @@ with tempfile.TemporaryDirectory(prefix="xtweet-reg-") as td:
         _, saved = run(env, "draft", "get", ok=True)
         assert saved["text"] == "B", saved
 
+    # Planted FIFOs on predictable paths must not block; oversized local
+    # files and stdin must be refused instead of being slurped unbounded.
+    cfg_file.write_text("paid_api = false\n")
+    os.chmod(cfg_file, 0o600)
+
+    def quick(*args, payload=None, input_bytes=None):
+        p = subprocess.run(
+            [PY, str(BACKEND), *args],
+            input=(
+                input_bytes
+                if input_bytes is not None
+                else (None if payload is None else json.dumps(payload))
+            ),
+            text=input_bytes is None,
+            capture_output=True,
+            env=env,
+            timeout=2,
+        )
+        data = json.loads(p.stdout.decode() if isinstance(p.stdout, bytes) else p.stdout)
+        return p.returncode, data
+
+    saved_cfg = cfg_file.read_text()
+    cfg_file.unlink()
+    os.mkfifo(cfg_file, 0o600)
+    os.chmod(cfg_file, 0o600)
+    rc, fifo_cfg = quick("mode")
+    os.unlink(cfg_file)
+    cfg_file.write_text(saved_cfg)
+    os.chmod(cfg_file, 0o600)
+    assert rc != 0 and fifo_cfg.get("ok") is False, fifo_cfg
+    assert "regular file" in fifo_cfg.get("message", ""), fifo_cfg
+
+    draft_path = cfg_dir / "draft.json"
+    if draft_path.exists() or draft_path.is_fifo():
+        draft_path.unlink()
+    os.mkfifo(draft_path)
+    rc, fifo_draft = quick("draft", "get")
+    os.unlink(draft_path)
+    assert rc == 0 and fifo_draft.get("ok") is True, fifo_draft
+    assert fifo_draft.get("text") == "", fifo_draft
+
+    rt = runtime / "x.composer"
+    assert rt.is_dir()
+    active = rt / "active"
+    if active.exists() or active.is_fifo():
+        active.unlink()
+    os.mkfifo(active)
+    rc, fifo_active = quick("active")
+    os.unlink(active)
+    assert rc == 0 and fifo_active.get("ok") is True and fifo_active.get("active") is None, fifo_active
+
+    lock_path = rt / "lock"
+    if lock_path.exists() or lock_path.is_fifo():
+        lock_path.unlink()
+    os.mkfifo(lock_path)
+    rc, fifo_lock = quick("active")
+    os.unlink(lock_path)
+    assert rc != 0 and fifo_lock.get("ok") is False, fifo_lock
+    assert "regular file" in fifo_lock.get("message", ""), fifo_lock
+
+    huge_cfg = "paid_api = false\n" + ("# " + "x" * 80 + "\n") * 900
+    assert len(huge_cfg.encode()) > 64 * 1024
+    cfg_file.write_text(huge_cfg)
+    os.chmod(cfg_file, 0o600)
+    rc, huge = quick("mode")
+    cfg_file.write_text("paid_api = false\n")
+    os.chmod(cfg_file, 0o600)
+    assert rc != 0 and huge.get("ok") is False, huge
+    assert "exceeds" in huge.get("message", ""), huge
+
+    rc, huge_in = quick(
+        "enqueue",
+        input_bytes=b'{"text":"' + b"A" * (128 * 1024) + b'"}',
+    )
+    assert rc != 0 and huge_in.get("ok") is False, huge_in
+    assert huge_in.get("kind") == "input" and "exceeds" in huge_in.get("message", ""), huge_in
+
 # API result classification with the network fully mocked: a confirmed
 # post ID is "posted", a 4xx is a clean "rejected", and anything ambiguous
 # (5xx, empty body, network error) is "unknown" — never silently retried.
@@ -215,6 +294,7 @@ class Resp:
     def __init__(self, status, body):
         self.status = status
         self.body = body
+        self._offset = 0
 
     def __enter__(self):
         return self
@@ -222,8 +302,14 @@ class Resp:
     def __exit__(self, *a):
         return False
 
-    def read(self):
-        return self.body
+    def read(self, n=-1):
+        if n is None or n < 0:
+            out = self.body[self._offset :]
+            self._offset = len(self.body)
+            return out
+        out = self.body[self._offset : self._offset + n]
+        self._offset += len(out)
+        return out
 
 
 mod.urllib.request.urlopen = lambda req, timeout: Resp(
@@ -249,4 +335,21 @@ mod.urllib.request.urlopen = lambda req, timeout: (_ for _ in ()).throw(
     urllib.error.URLError("connection reset")
 )
 assert mod.api_post_tweet("x", "a", "b", "c", "d")["state"] == "unknown"
+mod.urllib.request.urlopen = lambda req, timeout: Resp(
+    201, json.dumps({"data": {"id": "1"}}).encode() + b"x" * (mod.MAX_HTTP_BODY_BYTES + 1)
+)
+assert mod.api_post_tweet("x", "a", "b", "c", "d")["state"] == "unknown"
+
+
+def http_body(code, body):
+    def fail(req, timeout):
+        raise urllib.error.HTTPError(req.full_url, code, "err", {}, io.BytesIO(body))
+
+    return fail
+
+
+mod.urllib.request.urlopen = http_body(401, b"x" * (mod.MAX_HTTP_BODY_BYTES + 1))
+rejected = mod.api_post_tweet("x", "a", "b", "c", "d")
+assert rejected["state"] == "rejected", rejected
+assert "HTTP 401" in rejected["message"], rejected
 print("backend regression: PASS")
