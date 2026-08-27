@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "x.composer",
+  "name": "X Composer",
+  "version": "1.0.2",
+  "author": "maiosx",
+  "license": "MIT",
+  "description": "Fullscreen X composer overlay. Serif on black, no outline. Browser handoff by default, optional paid API.",
+  "kinds": [
+    "overlay",
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Composer.qml",
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "X Composer",
+    "description": "Open the fullscreen X composer overlay",
+    "category": "Network",
+    "aliases": ["x", "twitter", "tweet", "compose", "xtweet"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
