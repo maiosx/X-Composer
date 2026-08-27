@@ -197,16 +197,6 @@ Item {
           event.accepted = true
           root.dismiss()
         }
-        Keys.onReturnPressed: function (event) {
-          if (event.modifiers & Qt.ShiftModifier) return
-          event.accepted = true
-          root.submit()
-        }
-        Keys.onEnterPressed: function (event) {
-          if (event.modifiers & Qt.ShiftModifier) return
-          event.accepted = true
-          root.submit()
-        }
       }
 
       Item {
@@ -237,7 +227,7 @@ Item {
           }
 
           Text {
-            text: "Enter to continue · Shift+Enter for a new line · Esc to close"
+            text: "Esc to close"
             color: root.subtle
             font.pixelSize: 11
             font.family: "sans-serif"

@@ -30,7 +30,7 @@ Enable the **X Composer** bar widget from Setup → Bar if it does not appear on
 
 - Click **X** in the bar to open or close the overlay.
 - Type in the centered serif field. There is no panel chrome and no outline.
-- **Enter** continues in X (or posts, in paid API mode). **Shift+Enter** inserts a newline. **Escape** dismisses.
+- **Continue in X** hands off to the web composer (or posts, in paid API mode). **Escape** dismisses.
 - Drafts persist across open/close cycles.
 
 IPC:
